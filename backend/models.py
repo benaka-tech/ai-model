@@ -78,6 +78,38 @@ def load_and_quantize_models():
         
         def decode(self, *args, **kwargs):
             return self.tokenizer.decode(*args, **kwargs)
+        
+        def forward(self, *args, **kwargs):
+            return self.model(*args, **kwargs)
+        
+        def answer_question(self, context, question):
+            inputs = self.tokenizer.encode_plus(
+                text=question,
+                text_pair=context,
+                return_tensors='pt',
+                truncation=True,
+                max_length=512
+            )
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            answer_start = torch.argmax(outputs.start_logits)
+            answer_end = torch.argmax(outputs.end_logits) + 1
+            answer = self.tokenizer.convert_tokens_to_string(
+                self.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0][answer_start:answer_end])
+            )
+            return answer
+        
+        def analyze_sentiment(self, text):
+            inputs = self.tokenizer(text, return_tensors='pt', truncation=True, max_length=512)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            probabilities = torch.nn.functional.softmax(outputs.logits, dim=-1)[0]
+            prediction = torch.argmax(probabilities).item()
+            confidence = probabilities[prediction].item()
+            sentiment = 'positive' if prediction == 1 else 'negative'
+            return sentiment, confidence
     
     # Wrap models with their tokenizers
     summarizer = ModelWrapper(summarization_model, summarization_tokenizer)
