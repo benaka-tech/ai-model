@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, g
 from flask_cors import CORS  # Add this import
 from models import (
     load_and_quantize_models,
@@ -10,6 +10,8 @@ import torch
 from PIL import Image
 import io
 import json
+import time
+import psutil
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -36,6 +38,35 @@ CORS(app, resources={
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Middleware to measure request latency
+@app.before_request
+def start_timer():
+    g.start_time = time.time()
+
+@app.after_request
+def log_request_metrics(response):
+    latency = time.time() - g.start_time
+    app.logger.info(f"Endpoint: {request.path}, Method: {request.method}, Latency: {latency:.2f}s, Status: {response.status_code}")
+    return response
+
+@app.route('/metrics', methods=['GET'])
+def get_metrics():
+    # Calculate real metrics
+    latency = time.time() - g.start_time if hasattr(g, 'start_time') else None
+    throughput = 1 / latency if latency else None
+    error_rate = 0  # Placeholder, you can calculate this based on actual errors logged
+    cpu_usage = psutil.cpu_percent(interval=1)
+    memory_usage = psutil.virtual_memory().percent
+
+    metrics_data = {
+        "latency": latency,
+        "throughput": throughput,
+        "error_rate": error_rate,
+        "cpu_usage": cpu_usage,
+        "memory_usage": memory_usage
+    }
+    return jsonify(metrics_data)
 
 # Load models at startup
 summarizer, qa_model, sentiment_model, image_model, image_transform = load_and_quantize_models()
