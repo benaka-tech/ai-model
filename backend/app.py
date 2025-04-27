@@ -1,9 +1,6 @@
 from flask import Flask, request, jsonify, g
-from flask_cors import CORS  # Add this import
-from models import (
-    load_and_quantize_models,
-    load_ocr_reader
-)
+from flask_cors import CORS
+from models import load_and_quantize_models, load_ocr_reader
 import logging
 from dotenv import load_dotenv
 import torch
@@ -12,6 +9,9 @@ import io
 import json
 import time
 import psutil
+import os
+from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments
+from datasets import load_dataset
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,7 +23,6 @@ except ImportError as e:
 
 load_dotenv()
 app = Flask(__name__)
-# Enable CORS with specific origins
 CORS(app, resources={
     r"/*": {
         "origins": [
@@ -35,16 +34,13 @@ CORS(app, resources={
     }
 })
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Middleware to measure request latency
 @app.before_request
-def start_timer():
+def before_request():
     g.start_time = time.time()
 
-@app.after_request
 def log_request_metrics(response):
     latency = time.time() - g.start_time
     app.logger.info(f"Endpoint: {request.path}, Method: {request.method}, Latency: {latency:.2f}s, Status: {response.status_code}")
@@ -52,29 +48,35 @@ def log_request_metrics(response):
 
 @app.route('/metrics', methods=['GET'])
 def get_metrics():
-    # Calculate real metrics
     latency = time.time() - g.start_time if hasattr(g, 'start_time') else None
     throughput = 1 / latency if latency else None
-    error_rate = 0  # Placeholder, you can calculate this based on actual errors logged
+    error_rate = 0
     cpu_usage = psutil.cpu_percent(interval=1)
-    memory_usage = psutil.virtual_memory().percent
+    memory_info = psutil.virtual_memory()
+    memory_usage = memory_info.percent
+    available_memory = memory_info.available / (1024 ** 2)
+    total_memory = memory_info.total / (1024 ** 2)
 
-    metrics_data = {
-        "latency": latency,
-        "throughput": throughput,
-        "error_rate": error_rate,
-        "cpu_usage": cpu_usage,
-        "memory_usage": memory_usage
+    disk_usage = psutil.disk_usage('/')
+    disk_usage_percent = disk_usage.percent
+
+    network_io = psutil.net_io_counters()
+    bytes_sent = network_io.bytes_sent
+    bytes_received = network_io.bytes_recv
+
+    metrics = {
+        'latency': latency,
+        'throughput': throughput,
+        'error_rate': error_rate,
+        'cpu_usage': cpu_usage,
+        'memory_usage': memory_usage,
+        'available_memory': available_memory,
+        'total_memory': total_memory,
+        'disk_usage_percent': disk_usage_percent,
+        'bytes_sent': bytes_sent,
+        'bytes_received': bytes_received
     }
-    return jsonify(metrics_data)
-
-# Load models at startup
-summarizer, qa_model, sentiment_model, image_model, image_transform = load_and_quantize_models()
-ocr_reader = load_ocr_reader()
-
-# Load ImageNet class index-to-label mapping
-with open('imagenet_class_index.json', 'r') as f:
-    imagenet_classes = {int(key): value[1] for key, value in json.load(f).items()}
+    return jsonify(metrics)
 
 @app.route('/summarize', methods=['POST'])
 def summarize_text():
@@ -159,6 +161,107 @@ def extract_text():
     except Exception as e:
         logger.error(f"OCR error: {str(e)}")
         return jsonify({'error': str(e)}), 500
+
+# Fine-tune a sentiment analysis model
+@app.route('/fine-tune-sentiment', methods=['POST'])
+def fine_tune_sentiment():
+    try:
+        # Load the public synthetic-student-feedback dataset
+        dataset = load_dataset("janerkegb/synthetic-student-feedback")
+        tokenizer = DistilBertTokenizer.from_pretrained("distilbert-base-uncased")
+
+        # Map the `intent` column to `labels` and convert to integers
+        label_mapping = {
+            "POSITIVE_FEEDBACK": 0,
+            "NEGATIVE_FEEDBACK": 1,
+            "TEACHING_QUALITY": 2,
+            "EXAM_DIFFICULTY": 3,
+            "HOMEWORK_LOAD": 4,
+            "LECTURE_SPEED": 5,
+            "NEUTRAL_COMMENT": 6,
+            "COURSE_MATERIALS": 7,
+            "SUGGESTION": 8
+        }
+        dataset = dataset.map(lambda x: {"labels": label_mapping[x["intent"]]})
+
+        # Split the dataset into train and test sets if 'test' split is not available
+        if "test" not in dataset:
+            dataset = dataset["train"].train_test_split(test_size=0.2, seed=42)
+
+        # Adjust the column name based on the dataset structure
+        def preprocess_function(examples):
+            return tokenizer(examples["feedback_text"], truncation=True, padding='max_length', max_length=128)
+
+        tokenized_datasets = dataset.map(preprocess_function, batched=True)
+
+        # Load pre-trained model
+        model = DistilBertForSequenceClassification.from_pretrained("distilbert-base-uncased", num_labels=len(label_mapping))
+
+        # Define training arguments
+        training_args = TrainingArguments(
+            output_dir="./results",
+            evaluation_strategy="epoch",
+            learning_rate=2e-5,
+            per_device_train_batch_size=4,
+            num_train_epochs=1,
+            weight_decay=0.01,
+            save_strategy="epoch",
+            logging_dir="./logs",
+            logging_steps=10,
+        )
+
+        # Initialize Trainer
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=tokenized_datasets["train"].shuffle(seed=42),
+            eval_dataset=tokenized_datasets["test"].shuffle(seed=42)
+        )
+
+        # Train the model
+        trainer.train()
+
+        # Save the fine-tuned model
+        model.save_pretrained("./fine_tuned_sentiment_model")
+        tokenizer.save_pretrained("./fine_tuned_sentiment_model")
+
+        return jsonify({"message": "Model fine-tuned and saved successfully."})
+    except Exception as e:
+        logger.error(f"Fine-tuning error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+# Load fine-tuned model and tokenizer
+try:
+    fine_tuned_model = DistilBertForSequenceClassification.from_pretrained("./fine_tuned_sentiment_model")
+    fine_tuned_tokenizer = DistilBertTokenizer.from_pretrained("./fine_tuned_sentiment_model")
+except Exception as e:
+    logger.error(f"Error loading fine-tuned model: {str(e)}")
+    fine_tuned_model = None
+    fine_tuned_tokenizer = None
+
+# Inference function
+def predict_sentiment(text):
+    if fine_tuned_model is None or fine_tuned_tokenizer is None:
+        return "Model not loaded"
+
+    inputs = fine_tuned_tokenizer(text, padding=True, truncation=True, max_length=73, return_tensors="pt")
+    with torch.no_grad():
+        outputs = fine_tuned_model(**inputs)
+    predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+    sentiment_label = torch.argmax(predictions).item()
+    return "Positive" if sentiment_label == 1 else "Negative"
+
+# API endpoint for sentiment prediction
+@app.route('/predict-sentiment', methods=['POST'])
+def predict_sentiment_route():
+    try:
+        data = request.get_json()
+        text = data['text']
+        sentiment = predict_sentiment(text)
+        return jsonify({"sentiment": sentiment})
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000)

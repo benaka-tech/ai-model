@@ -12,4 +12,7 @@ gunicorn==20.1.0
 # Add explicit dependencies for smaller models
 sentencepiece  # Required for DistilBERT
 protobuf<=3.20.0  # Compatibility with older transformers
-numpy
+numpy<2
+# Add missing dependencies for fine-tuning and CORS
+flask-cors
+datasets
